@@ -18,9 +18,13 @@ import requests
 import socketio
 
 try:
+    import win32con
     import win32print
+    import win32ui
 except ImportError:  # pragma: no cover - handled at runtime for missing dependency
+    win32con = None
     win32print = None
+    win32ui = None
 
 
 APP_NAME = "Donation Receipt Printer"
@@ -34,6 +38,9 @@ RW80L_MKII_CHARS_PER_LINE = 48
 RW80L_MKII_CODE_PAGE = 0  # PC437 in ESC/POS.
 RW80L_MKII_FEED_LINES = 4
 RW80L_MKII_PARTIAL_CUT_COMMAND = b"\x1d\x56\x01"
+PRINT_MODE_AUTO = "auto"
+PRINT_MODE_RAW = "raw"
+PRINT_MODE_WINDOWS = "windows"
 
 
 def get_app_dir() -> Path:
@@ -88,17 +95,13 @@ def add_labeled_lines(lines: list[str], label: str, value: str, width: int):
         lines.append((" " * len(prefix)) + line)
 
 
-def escpos_receipt_bytes(
+def donation_receipt_lines(
     username: str,
     message: str,
     amount: str,
     currency: str,
-    include_cut: bool = True,
     chars_per_line: int = RW80L_MKII_CHARS_PER_LINE,
-    code_page: int = RW80L_MKII_CODE_PAGE,
-    feed_lines: int = RW80L_MKII_FEED_LINES,
-    cut_command: bytes = RW80L_MKII_PARTIAL_CUT_COMMAND,
-) -> bytes:
+) -> list[str]:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     username = sanitize_text(username) or "Anonymous"
     message = sanitize_text(message) or "(No message)"
@@ -122,8 +125,29 @@ def escpos_receipt_bytes(
     lines.append("Message:")
     lines.extend(wrap_text(message, chars_per_line))
     lines.extend(["", "Thank you!".center(chars_per_line), separator, ""])
+    return lines
 
-    text_payload = "\n".join(lines)
+
+def escpos_receipt_bytes(
+    username: str,
+    message: str,
+    amount: str,
+    currency: str,
+    include_cut: bool = True,
+    chars_per_line: int = RW80L_MKII_CHARS_PER_LINE,
+    code_page: int = RW80L_MKII_CODE_PAGE,
+    feed_lines: int = RW80L_MKII_FEED_LINES,
+    cut_command: bytes = RW80L_MKII_PARTIAL_CUT_COMMAND,
+) -> bytes:
+    text_payload = "\n".join(
+        donation_receipt_lines(
+            username=username,
+            message=message,
+            amount=amount,
+            currency=currency,
+            chars_per_line=chars_per_line,
+        )
+    )
     try:
         payload = text_payload.encode("cp437", errors="replace")
     except LookupError:
@@ -144,6 +168,7 @@ class PrinterService:
         self,
         printer_name: str,
         include_cut: bool = True,
+        print_mode: str = PRINT_MODE_AUTO,
         chars_per_line: int = RW80L_MKII_CHARS_PER_LINE,
         code_page: int = RW80L_MKII_CODE_PAGE,
         feed_lines: int = RW80L_MKII_FEED_LINES,
@@ -151,6 +176,7 @@ class PrinterService:
     ):
         self.printer_name = printer_name
         self.include_cut = include_cut
+        self.print_mode = print_mode
         self.chars_per_line = chars_per_line
         self.code_page = code_page
         self.feed_lines = feed_lines
@@ -175,6 +201,27 @@ class PrinterService:
         if not self.printer_name:
             raise RuntimeError("No printer selected.")
 
+        resolved_mode = self._resolve_print_mode()
+        if resolved_mode == PRINT_MODE_WINDOWS:
+            self._print_donation_windows(username=username, message=message, amount=amount, currency=currency)
+            return
+        self._print_donation_raw(username=username, message=message, amount=amount, currency=currency)
+
+    def _resolve_print_mode(self) -> str:
+        mode = (self.print_mode or PRINT_MODE_AUTO).strip().lower()
+        if mode in (PRINT_MODE_RAW, PRINT_MODE_WINDOWS):
+            return mode
+
+        name = (self.printer_name or "").lower()
+        if "microsoft print to pdf" in name or name.endswith("pdf"):
+            return PRINT_MODE_WINDOWS
+
+        receipt_keywords = ("rw80", "receipt", "thermal", "esc/pos", "tm-", "xprinter", "pos")
+        if any(keyword in name for keyword in receipt_keywords):
+            return PRINT_MODE_RAW
+        return PRINT_MODE_WINDOWS
+
+    def _print_donation_raw(self, username: str, message: str, amount: str, currency: str) -> None:
         content = escpos_receipt_bytes(
             username=username,
             message=message,
@@ -197,6 +244,89 @@ class PrinterService:
                 win32print.EndDocPrinter(handle)
         finally:
             win32print.ClosePrinter(handle)
+
+    def _print_donation_windows(self, username: str, message: str, amount: str, currency: str) -> None:
+        if win32ui is None or win32con is None:
+            raise RuntimeError("pywin32 UI modules are not installed. Reinstall dependencies.")
+
+        lines = donation_receipt_lines(
+            username=username,
+            message=message,
+            amount=amount,
+            currency=currency,
+            chars_per_line=self.chars_per_line,
+        )
+
+        dc = win32ui.CreateDC()
+        dc.CreatePrinterDC(self.printer_name)
+        font = None
+        old_font = None
+        started_doc = False
+        started_page = False
+        try:
+            dc.StartDoc("Donation Receipt")
+            started_doc = True
+            dc.StartPage()
+            started_page = True
+
+            font = win32ui.CreateFont(
+                {
+                    "name": "Consolas",
+                    "height": -28,
+                    "weight": 400,
+                }
+            )
+            old_font = dc.SelectObject(font)
+
+            left_margin = 120
+            top_margin = 120
+            line_height = dc.GetTextExtent("Ag")[1] + 8
+            max_y = dc.GetDeviceCaps(win32con.VERTRES) - top_margin
+            y = top_margin
+
+            for line in lines:
+                if y + line_height > max_y:
+                    dc.EndPage()
+                    started_page = False
+                    dc.StartPage()
+                    started_page = True
+                    if font is not None:
+                        dc.SelectObject(font)
+                    y = top_margin
+                dc.TextOut(left_margin, y, line)
+                y += line_height
+
+            if started_page:
+                dc.EndPage()
+                started_page = False
+            if started_doc:
+                dc.EndDoc()
+                started_doc = False
+        finally:
+            if old_font is not None:
+                try:
+                    dc.SelectObject(old_font)
+                except Exception:
+                    pass
+            if font is not None:
+                try:
+                    font.DeleteObject()
+                except Exception:
+                    pass
+            if started_page:
+                try:
+                    dc.EndPage()
+                except Exception:
+                    pass
+            if started_doc:
+                try:
+                    dc.EndDoc()
+                except Exception:
+                    pass
+            try:
+                dc.DeleteDC()
+            except Exception:
+                pass
 
 
 class StreamlabsListener:
@@ -371,6 +501,7 @@ class App:
         self.redirect_uri_var = StringVar(value=DEFAULT_REDIRECT_URI)
         self.access_token_var = StringVar()
         self.printer_var = StringVar()
+        self.print_mode_var = StringVar(value=PRINT_MODE_AUTO)
         self.cut_var = StringVar(value="yes")
         self.refresh_token = ""
         self._oauth_thread = None
@@ -416,9 +547,13 @@ class App:
         )
 
         ttk.Label(frame, text="Auto-cut Receipt").grid(row=10, column=0, sticky="w")
+        ttk.Label(frame, text="Print Mode").grid(row=10, column=1, sticky="w")
         cut_combo = ttk.Combobox(frame, textvariable=self.cut_var, width=10, state="readonly")
         cut_combo["values"] = ("yes", "no")
         cut_combo.grid(row=11, column=0, sticky="w", pady=(2, 10))
+        print_mode_combo = ttk.Combobox(frame, textvariable=self.print_mode_var, width=12, state="readonly")
+        print_mode_combo["values"] = (PRINT_MODE_AUTO, PRINT_MODE_RAW, PRINT_MODE_WINDOWS)
+        print_mode_combo.grid(row=11, column=1, sticky="w", pady=(2, 10))
 
         controls = ttk.Frame(frame)
         controls.grid(row=12, column=0, columnspan=5, sticky="ew", pady=(0, 10))
@@ -660,6 +795,7 @@ class App:
             "access_token": self.access_token_var.get().strip(),
             "refresh_token": self.refresh_token,
             "printer_name": self.printer_var.get().strip(),
+            "print_mode": self.print_mode_var.get().strip().lower() or PRINT_MODE_AUTO,
             "cut_receipt": self.cut_var.get().strip().lower() == "yes",
         }
         CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -676,6 +812,10 @@ class App:
             self.access_token_var.set(data.get("access_token", ""))
             self.refresh_token = data.get("refresh_token", "")
             self.printer_var.set(data.get("printer_name", ""))
+            configured_mode = str(data.get("print_mode", PRINT_MODE_AUTO)).strip().lower()
+            if configured_mode not in (PRINT_MODE_AUTO, PRINT_MODE_RAW, PRINT_MODE_WINDOWS):
+                configured_mode = PRINT_MODE_AUTO
+            self.print_mode_var.set(configured_mode)
             self.cut_var.set("yes" if data.get("cut_receipt", True) else "no")
             self._queue_log(f"Loaded config from {CONFIG_PATH}.")
         except Exception as exc:
@@ -685,6 +825,7 @@ class App:
         return PrinterService(
             printer_name=self.printer_var.get().strip(),
             include_cut=self.cut_var.get().strip().lower() == "yes",
+            print_mode=self.print_mode_var.get().strip().lower() or PRINT_MODE_AUTO,
         )
 
     def _start(self):

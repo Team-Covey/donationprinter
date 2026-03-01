@@ -60,9 +60,13 @@ Installer output:
 3. Confirm Redirect URI matches your Streamlabs app settings.
 4. Click `Connect Streamlabs` and approve access in browser.
 5. Pick your receipt printer.
-6. Click `Save Config`.
-7. Click `Start Listening`.
-8. Use `Test Print` to verify printer formatting before going live.
+6. Set `Print Mode`:
+   - `auto` for smart default routing
+   - `raw` for ESC/POS receipt printers
+   - `windows` for normal printers and `Microsoft Print to PDF`
+7. Click `Save Config`.
+8. Click `Start Listening`.
+9. Use `Test Print` to verify printer formatting before going live.
 
 ## Notes
 
@@ -70,7 +74,8 @@ Installer output:
 - `Connect Streamlabs` uses OAuth authorization-code flow and requests:
   - `socket.token`
   - `donations.read`
-- Printer output uses raw ESC/POS commands and should work for most thermal receipt printers.
+- `Print Mode = windows` supports `Microsoft Print to PDF` for local no-printer testing.
+- Printer output uses raw ESC/POS commands for receipt printers (`Print Mode = raw`).
 - Tuned defaults for `RW80L MKII`:
   - 48 columns (Font A on 80mm paper)
   - ESC/POS partial cut command

@@ -1,0 +1,4 @@
+pywin32>=306
+python-socketio[client]>=5.11.0
+requests>=2.31.0
+pyinstaller>=6.6.0

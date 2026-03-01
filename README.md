@@ -11,7 +11,9 @@ It prints:
 
 - Windows PC
 - Python 3.10+ installed
-- Streamlabs API access token with permission to request a socket token
+- Streamlabs developer app (`Client ID` + `Client Secret`)
+- Redirect URI set in your Streamlabs app, for example:
+  - `http://127.0.0.1:53177/callback`
 - Installed printer driver for your receipt printer
 
 ## Run from source
@@ -54,15 +56,20 @@ Installer output:
 ## How to use
 
 1. Launch the app.
-2. Paste your Streamlabs access token.
-3. Pick your receipt printer.
-4. Click `Save Config`.
-5. Click `Start Listening`.
-6. Use `Test Print` to verify printer formatting before going live.
+2. Enter your Streamlabs `Client ID` and `Client Secret`.
+3. Confirm Redirect URI matches your Streamlabs app settings.
+4. Click `Connect Streamlabs` and approve access in browser.
+5. Pick your receipt printer.
+6. Click `Save Config`.
+7. Click `Start Listening`.
+8. Use `Test Print` to verify printer formatting before going live.
 
 ## Notes
 
 - The app uses Streamlabs Socket API so it can run locally without opening inbound ports.
+- `Connect Streamlabs` uses OAuth authorization-code flow and requests:
+  - `socket.token`
+  - `donations.read`
 - Printer output uses raw ESC/POS commands and should work for most thermal receipt printers.
 - Tuned defaults for `RW80L MKII`:
   - 48 columns (Font A on 80mm paper)

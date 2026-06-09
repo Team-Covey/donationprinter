@@ -2,6 +2,7 @@ import json
 import os
 import queue
 import secrets
+import socket
 import sys
 import textwrap
 import threading
@@ -41,6 +42,260 @@ RW80L_MKII_PARTIAL_CUT_COMMAND = b"\x1d\x56\x01"
 PRINT_MODE_AUTO = "auto"
 PRINT_MODE_RAW = "raw"
 PRINT_MODE_WINDOWS = "windows"
+
+# PSX (Aerowinx Precision Simulator) EICAS integration constants.
+PSX_DEFAULT_HOST = "localhost"
+PSX_DEFAULT_PORT = 10747
+PSX_FREEMSG_WARNING = 418  # Qs418 = FreeMsgW - custom Warning EICAS message (max 16 chars)
+PSX_FREEMSG_CAUTION = 419  # Qs419 = FreeMsgC - custom Caution EICAS message (max 16 chars)
+PSX_EICAS_MSG_UPD = 138    # Qi138 = EicasMsgUpd - triggers EICAS message list refresh
+PSX_PRINTER_TEXT = 119     # Qs119 = PrinterText - ARINC 604 cockpit printer (max 24576 chars)
+PSX_MAST_WARN_CP = 114     # Qh114 = MastWarnCp - Master Warning button Captain (BIGMOM)
+PSX_MAST_WARN_FO = 115     # Qh115 = MastWarnFo - Master Warning button First Officer (BIGMOM)
+PSX_EICAS_CANC = 111       # Qh111 = EicasCanc - EICAS Cancel button (DELTA)
+PSX_BIGMOM_PUSHED = 1      # Bit 0: button pushed (DELTA)
+PSX_BIGMOM_WARN_LIGHT = 128  # Bit 7: upper light contact = Warning (red)
+PSX_BIGMOM_CAUT_LIGHT = 256  # Bit 8: lower light contact = Caution (amber)
+PSX_DONATION_THRESHOLD = 50.0  # Donations above this trigger Warning; at or below trigger Caution
+PSX_RECONNECT_INTERVAL = 10     # Seconds between PSX connection retries
+
+
+class PSXClient:
+    """TCP client for Aerowinx PSX network. Sends EICAS messages to the simulator."""
+
+    def __init__(self, host: str = PSX_DEFAULT_HOST, port: int = PSX_DEFAULT_PORT, log=None):
+        self.host = host
+        self.port = port
+        self.log = log or (lambda msg: None)
+        self._socket = None
+        self._lock = threading.Lock()
+        self._connected = False
+        self._reader_thread = None
+        self._stop_event = threading.Event()
+        self._has_donation_alert = False  # tracks if a donation EICAS message is active
+        # Track current Master Warning button bitmask values from PSX
+        self._mast_warn_cp_bits = 0
+        self._mast_warn_fo_bits = 0
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    def connect(self) -> None:
+        with self._lock:
+            if self._connected:
+                return
+            try:
+                self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._socket.settimeout(10)
+                self._socket.connect((self.host, self.port))
+                self._socket.settimeout(None)
+                self._connected = True
+                self._stop_event.clear()
+                self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+                self._reader_thread.start()
+                self.log(f"Connected to PSX at {self.host}:{self.port}")
+            except Exception as exc:
+                self._connected = False
+                if self._socket:
+                    try:
+                        self._socket.close()
+                    except Exception:
+                        pass
+                self._socket = None
+                raise RuntimeError(f"Failed to connect to PSX at {self.host}:{self.port}: {exc}") from exc
+
+    def connect_with_retry(self) -> None:
+        """Keep trying to connect to PSX until successful or stopped."""
+        while not self._stop_event.is_set():
+            try:
+                self.connect()
+                return  # success
+            except RuntimeError:
+                self.log(f"PSX not available, retrying in {PSX_RECONNECT_INTERVAL}s...")
+                self._stop_event.wait(PSX_RECONNECT_INTERVAL)
+
+    def disconnect(self) -> None:
+        with self._lock:
+            self._stop_event.set()
+            self._connected = False
+            if self._socket:
+                try:
+                    self._send_raw("exit")
+                except Exception:
+                    pass
+                try:
+                    self._socket.close()
+                except Exception:
+                    pass
+                self._socket = None
+            self.log("Disconnected from PSX.")
+
+    def send_eicas_message(self, username: str, amount_str: str, message: str) -> None:
+        """Send a donation notification to PSX EICAS using FreeMsgW/C variables
+        and illuminate the Master Warning/Caution light to trigger the aural alert.
+
+        >$50: FreeMsgW + Master Warning light (red) + fire bell
+        <=$50: FreeMsgC + Master Caution light (amber) + single chime
+        """
+        if not self._connected:
+            raise RuntimeError("Not connected to PSX.")
+
+        amount_numeric = self._parse_amount(amount_str)
+
+        if amount_numeric > PSX_DONATION_THRESHOLD:
+            qs_index = PSX_FREEMSG_WARNING
+            light_bit = PSX_BIGMOM_WARN_LIGHT
+            level_label = "WARNING"
+        else:
+            qs_index = PSX_FREEMSG_CAUTION
+            light_bit = PSX_BIGMOM_CAUT_LIGHT
+            level_label = "CAUTION"
+
+        eicas_text = "DONATION ALERT"
+
+        # Set the EICAS free message text
+        self._send_raw(f"Qs{qs_index}={eicas_text}")
+        # Trigger EICAS message list refresh
+        self._send_raw(f"Qi{PSX_EICAS_MSG_UPD}=1")
+
+        # Illuminate the Master Warning/Caution light on the button to trigger
+        # the aural alert (fire bell for Warning, chime for Caution).
+        # Per PSX docs: "Network injectors can set any status directly."
+        # We OR the light bit into the current bitmask to preserve other state.
+        cp_bits = self._mast_warn_cp_bits | light_bit
+        fo_bits = self._mast_warn_fo_bits | light_bit
+        self._send_raw(f"Qh{PSX_MAST_WARN_CP}={cp_bits}")
+        self._send_raw(f"Qh{PSX_MAST_WARN_FO}={fo_bits}")
+
+        self._has_donation_alert = True
+        self.log(f"PSX EICAS {level_label}: {eicas_text}")
+
+    def clear_eicas_message(self) -> None:
+        """Clear donation EICAS messages and extinguish the Master Warning/Caution light."""
+        if not self._connected:
+            return
+        # Clear both free message slots
+        self._send_raw(f"Qs{PSX_FREEMSG_WARNING}=")
+        self._send_raw(f"Qs{PSX_FREEMSG_CAUTION}=")
+        self._send_raw(f"Qi{PSX_EICAS_MSG_UPD}=1")
+
+        # Clear the donation light bits from the Master Warning button
+        # (preserve other bits like wired, bulb fails, etc.)
+        clear_mask = ~(PSX_BIGMOM_WARN_LIGHT | PSX_BIGMOM_CAUT_LIGHT)
+        cp_bits = self._mast_warn_cp_bits & clear_mask
+        fo_bits = self._mast_warn_fo_bits & clear_mask
+        self._send_raw(f"Qh{PSX_MAST_WARN_CP}={cp_bits}")
+        self._send_raw(f"Qh{PSX_MAST_WARN_FO}={fo_bits}")
+
+        self._has_donation_alert = False
+        self.log("PSX EICAS donation alert cleared.")
+
+    def send_printer_message(self, username: str, message: str, amount: str, currency: str) -> None:
+        """Send a donation receipt to the PSX ARINC 604 cockpit printer (Qs119)."""
+        if not self._connected:
+            raise RuntimeError("Not connected to PSX.")
+
+        donor = sanitize_text(username)[:30] or "Anonymous"
+        msg = sanitize_text(message)[:200] or "(No message)"
+        amt = sanitize_text(amount)[:15]
+        cur = sanitize_text(currency)[:5]
+        now = datetime.now().strftime("%d%b%y %H:%M")
+
+        # Format as cockpit printer output — lines separated by newline chars
+        # PSX PrinterText accepts plain text up to 24576 chars
+        lines = [
+            "=========================",
+            "  DONATION RECEIVED",
+            "=========================",
+            f"TIME: {now}",
+            f"FROM: {donor}",
+        ]
+        if amt:
+            lines.append(f"AMT:  {amt} {cur}".strip())
+        lines.append(f"MSG:  {msg}")
+        lines.append("=========================")
+        lines.append("")
+
+        printer_text = "\n".join(lines)
+        # Qs119 max is 24576 chars
+        command = f"Qs{PSX_PRINTER_TEXT}={printer_text[:24576]}"
+        self._send_raw(command)
+        self.log(f"PSX Printer: receipt sent for {donor}")
+
+    def _parse_amount(self, amount_str: str) -> float:
+        """Extract numeric value from amount string like '$50.00' or '50.00 USD'."""
+        cleaned = ""
+        for ch in (amount_str or ""):
+            if ch.isdigit() or ch == ".":
+                cleaned += ch
+        try:
+            return float(cleaned) if cleaned else 0.0
+        except ValueError:
+            return 0.0
+
+    def _send_raw(self, message: str) -> None:
+        """Send a raw newline-terminated message to PSX."""
+        if self._socket:
+            try:
+                self._socket.sendall((message + "\n").encode("ascii", errors="replace"))
+            except Exception as exc:
+                self._connected = False
+                raise RuntimeError(f"PSX send failed: {exc}") from exc
+
+    def _reader_loop(self) -> None:
+        """Read incoming PSX messages. Tracks Master Warning bitmask state
+        and watches for button presses to auto-clear donation alerts."""
+        try:
+            buf = b""
+            while not self._stop_event.is_set():
+                try:
+                    if self._socket is None:
+                        break
+                    self._socket.settimeout(1.0)
+                    data = self._socket.recv(4096)
+                    if not data:
+                        break
+                    buf += data
+                    while b"\n" in buf:
+                        line_bytes, buf = buf.split(b"\n", 1)
+                        self._process_incoming(line_bytes.decode("ascii", errors="replace").strip())
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+        finally:
+            self._connected = False
+
+    def _process_incoming(self, msg: str) -> None:
+        """Process an incoming PSX message: track bitmask state and detect button presses."""
+        if not msg.startswith("Q") or "=" not in msg:
+            return
+        try:
+            eq = msg.index("=")
+            q_code = msg[:eq]
+            val_str = msg[eq + 1:].strip()
+
+            if q_code[1] == "h":
+                q_index = int(q_code[2:])
+                val = int(val_str)
+
+                # Track current Master Warning bitmask values
+                if q_index == PSX_MAST_WARN_CP:
+                    self._mast_warn_cp_bits = val
+                elif q_index == PSX_MAST_WARN_FO:
+                    self._mast_warn_fo_bits = val
+
+                # Detect button presses to clear donation alert
+                if self._has_donation_alert:
+                    # Master Warning Captain or FO pressed (BIGMOM: bit 0 = pushed)
+                    if q_index in (PSX_MAST_WARN_CP, PSX_MAST_WARN_FO) and (val & PSX_BIGMOM_PUSHED):
+                        self.clear_eicas_message()
+                    # EICAS Cancel button pressed (DELTA: non-zero = pressed)
+                    elif q_index == PSX_EICAS_CANC and val != 0:
+                        self.clear_eicas_message()
+        except (ValueError, IndexError):
+            pass
 
 
 def get_app_dir() -> Path:
@@ -372,61 +627,65 @@ class StreamlabsListener:
         return True
 
     def _run(self, access_token: str):
-        try:
-            socket_token = self._get_socket_token(access_token)
-            self.log("Socket token acquired.")
-        except Exception as exc:
-            self.log(f"Failed to get socket token: {exc}")
-            return
-
-        sio = socketio.Client(
-            reconnection=True,
-            reconnection_attempts=0,
-            reconnection_delay=1,
-            reconnection_delay_max=10,
-            logger=False,
-            engineio_logger=False,
-        )
-        self._sio = sio
-
-        @sio.event
-        def connect():
-            self._connected_event.set()
-            self.log("Connected to Streamlabs socket.")
-
-        @sio.event
-        def disconnect():
-            self._connected_event.clear()
-            self.log("Disconnected from Streamlabs socket.")
-
-        @sio.event
-        def connect_error(data):
-            self.log(f"Socket connection error: {data}")
-
-        @sio.on("event")
-        def on_event(event_data):
-            try:
-                self._handle_event(event_data)
-            except Exception as exc:
-                self.log(f"Failed to process event: {exc}")
-
-        try:
-            sio.connect(
-                f"{STREAMLABS_SOCKET_URL}?token={socket_token}",
-                transports=["websocket"],
-                wait_timeout=20,
-            )
-        except Exception as exc:
-            self.log(f"Failed to connect to socket: {exc}")
-            return
-
         while not self._stop_event.is_set():
-            self._stop_event.wait(0.25)
+            try:
+                socket_token = self._get_socket_token(access_token)
+                self.log("Socket token acquired.")
+            except Exception as exc:
+                self.log(f"Failed to get socket token: {exc} — retrying in 15s...")
+                self._stop_event.wait(15)
+                continue
 
-        try:
-            sio.disconnect()
-        except Exception:
-            pass
+            sio = socketio.Client(
+                reconnection=True,
+                reconnection_attempts=0,
+                reconnection_delay=1,
+                reconnection_delay_max=10,
+                logger=False,
+                engineio_logger=False,
+            )
+            self._sio = sio
+
+            @sio.event
+            def connect():
+                self._connected_event.set()
+                self.log("Connected to Streamlabs socket.")
+
+            @sio.event
+            def disconnect():
+                self._connected_event.clear()
+                self.log("Disconnected from Streamlabs socket.")
+
+            @sio.event
+            def connect_error(data):
+                self.log(f"Socket connection error: {data}")
+
+            @sio.on("event")
+            def on_event(event_data):
+                try:
+                    self._handle_event(event_data)
+                except Exception as exc:
+                    self.log(f"Failed to process event: {exc}")
+
+            try:
+                sio.connect(
+                    f"{STREAMLABS_SOCKET_URL}?token={socket_token}",
+                    transports=["websocket"],
+                    wait_timeout=20,
+                )
+            except Exception as exc:
+                self.log(f"Failed to connect to socket: {exc} — retrying in 15s...")
+                self._stop_event.wait(15)
+                continue
+
+            while not self._stop_event.is_set():
+                self._stop_event.wait(0.25)
+
+            try:
+                sio.disconnect()
+            except Exception:
+                pass
+            break  # stop_event was set, exit the retry loop
 
     def _get_socket_token(self, access_token: str) -> str:
         headers = {
@@ -491,7 +750,7 @@ class App:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("820x580")
+        self.root.geometry("820x640")
 
         self.log_queue = queue.Queue()
         self.listener = StreamlabsListener(self._queue_log, self._handle_donation)
@@ -506,11 +765,20 @@ class App:
         self.refresh_token = ""
         self._oauth_thread = None
 
+        # PSX EICAS integration (always on)
+        self.psx_printer_var = StringVar(value="no")
+        self.psx_host_var = StringVar(value=PSX_DEFAULT_HOST)
+        self.psx_port_var = StringVar(value=str(PSX_DEFAULT_PORT))
+        self.psx_client = None
+        self._psx_connect_thread = None
+
         self._build_ui()
         self._load_config()
         self._refresh_printers()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._drain_log_queue)
+        # Auto-start PSX connection and Streamlabs listener
+        self.root.after(500, self._auto_start)
 
     def _build_ui(self):
         frame = ttk.Frame(self.root, padding=12)
@@ -555,15 +823,28 @@ class App:
         print_mode_combo["values"] = (PRINT_MODE_AUTO, PRINT_MODE_RAW, PRINT_MODE_WINDOWS)
         print_mode_combo.grid(row=11, column=1, sticky="w", pady=(2, 10))
 
+        # PSX Integration
+        ttk.Label(frame, text="PSX Printer").grid(row=12, column=0, sticky="w")
+        ttk.Label(frame, text="PSX Host").grid(row=12, column=1, sticky="w")
+        ttk.Label(frame, text="PSX Port").grid(row=12, column=2, sticky="w")
+        psx_printer_combo = ttk.Combobox(frame, textvariable=self.psx_printer_var, width=10, state="readonly")
+        psx_printer_combo["values"] = ("yes", "no")
+        psx_printer_combo.grid(row=13, column=0, sticky="w", pady=(2, 10))
+        ttk.Entry(frame, textvariable=self.psx_host_var, width=18).grid(row=13, column=1, sticky="w", pady=(2, 10))
+        ttk.Entry(frame, textvariable=self.psx_port_var, width=8).grid(row=13, column=2, sticky="w", pady=(2, 10))
+        ttk.Button(frame, text="Test PSX", command=self._test_psx).grid(
+            row=13, column=3, padx=(8, 0), sticky="ew"
+        )
+
         controls = ttk.Frame(frame)
-        controls.grid(row=12, column=0, columnspan=5, sticky="ew", pady=(0, 10))
+        controls.grid(row=14, column=0, columnspan=5, sticky="ew", pady=(0, 10))
         ttk.Button(controls, text="Start Listening", command=self._start).pack(side=LEFT)
         ttk.Button(controls, text="Stop", command=self._stop).pack(side=LEFT, padx=(8, 0))
         ttk.Button(controls, text="Test Print", command=self._test_print).pack(side=LEFT, padx=(8, 0))
         ttk.Button(controls, text="Clear Log", command=self._clear_log).pack(side=RIGHT)
 
-        self.log_text = ScrolledText(frame, height=22, state="normal")
-        self.log_text.grid(row=13, column=0, columnspan=5, sticky="nsew")
+        self.log_text = ScrolledText(frame, height=18, state="normal")
+        self.log_text.grid(row=15, column=0, columnspan=5, sticky="nsew")
         self.log_text.insert(END, f"{APP_NAME} ready.\n")
         self.log_text.configure(state="disabled")
 
@@ -572,7 +853,7 @@ class App:
         frame.grid_columnconfigure(2, weight=1)
         frame.grid_columnconfigure(3, weight=0)
         frame.grid_columnconfigure(4, weight=0)
-        frame.grid_rowconfigure(13, weight=1)
+        frame.grid_rowconfigure(15, weight=1)
 
     def _queue_log(self, message: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -797,6 +1078,9 @@ class App:
             "printer_name": self.printer_var.get().strip(),
             "print_mode": self.print_mode_var.get().strip().lower() or PRINT_MODE_AUTO,
             "cut_receipt": self.cut_var.get().strip().lower() == "yes",
+            "psx_printer": self.psx_printer_var.get().strip().lower() == "yes",
+            "psx_host": self.psx_host_var.get().strip() or PSX_DEFAULT_HOST,
+            "psx_port": self.psx_port_var.get().strip() or str(PSX_DEFAULT_PORT),
         }
         CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
         self._queue_log(f"Saved config to {CONFIG_PATH}.")
@@ -817,6 +1101,9 @@ class App:
                 configured_mode = PRINT_MODE_AUTO
             self.print_mode_var.set(configured_mode)
             self.cut_var.set("yes" if data.get("cut_receipt", True) else "no")
+            self.psx_printer_var.set("yes" if data.get("psx_printer", False) else "no")
+            self.psx_host_var.set(data.get("psx_host", PSX_DEFAULT_HOST))
+            self.psx_port_var.set(data.get("psx_port", str(PSX_DEFAULT_PORT)))
             self._queue_log(f"Loaded config from {CONFIG_PATH}.")
         except Exception as exc:
             self._queue_log(f"Failed to load config: {exc}")
@@ -833,14 +1120,42 @@ class App:
         if not access_token:
             self._queue_log("Access token is required.")
             return
-        if not self.printer_var.get().strip():
-            self._queue_log("Select a printer before starting.")
-            return
         try:
             self.listener.start(access_token)
             self._queue_log("Starting listener...")
         except Exception as exc:
             self._queue_log(f"Unable to start listener: {exc}")
+
+    def _auto_start(self):
+        """Auto-start PSX connection and Streamlabs listener on app launch."""
+        # Start PSX connection with retry in background
+        self._start_psx_background()
+        # Auto-start Streamlabs listener if access token is available
+        access_token = self.access_token_var.get().strip()
+        if access_token:
+            try:
+                self.listener.start(access_token)
+                self._queue_log("Auto-starting Streamlabs listener...")
+            except Exception as exc:
+                self._queue_log(f"Auto-start listener failed: {exc}")
+        else:
+            self._queue_log("No access token saved — connect Streamlabs to begin.")
+
+    def _start_psx_background(self):
+        """Start PSX connection in a background thread with auto-retry."""
+        if self._psx_connect_thread and self._psx_connect_thread.is_alive():
+            return
+        host = self.psx_host_var.get().strip() or PSX_DEFAULT_HOST
+        try:
+            port = int(self.psx_port_var.get().strip())
+        except ValueError:
+            port = PSX_DEFAULT_PORT
+        self.psx_client = PSXClient(host=host, port=port, log=self._queue_log)
+        self._psx_connect_thread = threading.Thread(
+            target=self.psx_client.connect_with_retry, daemon=True
+        )
+        self._psx_connect_thread.start()
+        self._queue_log(f"PSX EICAS connecting to {host}:{port}...")
 
     def _stop(self):
         self.listener.stop()
@@ -873,8 +1188,59 @@ class App:
         except Exception as exc:
             self._queue_log(f"Print failed for {username}: {exc}")
 
+        # Send to PSX if enabled (EICAS alert and/or ARINC printer)
+        self._send_to_psx(username=username, amount=amount, message=message, currency=currency)
+
+    def _get_psx_client(self) -> PSXClient | None:
+        """Get the PSX client if connected."""
+        if self.psx_client and self.psx_client.connected:
+            return self.psx_client
+        return None
+
+    def _send_to_psx(self, username: str, amount: str, message: str, currency: str = "") -> None:
+        """Send donation to PSX EICAS and optionally ARINC printer."""
+        try:
+            client = self._get_psx_client()
+            if not client:
+                self._queue_log("PSX not connected — EICAS alert skipped.")
+                return
+            client.send_eicas_message(username=username, amount_str=amount, message=message)
+            if self.psx_printer_var.get().strip().lower() == "yes":
+                client.send_printer_message(username=username, message=message, amount=amount, currency=currency)
+        except Exception as exc:
+            self._queue_log(f"PSX failed: {exc}")
+
+    def _test_psx(self):
+        """Test PSX connection by sending a test donation to EICAS and/or printer."""
+        try:
+            client = self._get_psx_client()
+            if not client:
+                self._queue_log("PSX not connected yet — waiting for connection.")
+                return
+            client.send_eicas_message(
+                username="TestDonor",
+                amount_str="$25.00",
+                message="PSX EICAS test message",
+            )
+            self._queue_log("PSX EICAS test sent (Caution level - $25 test).")
+            if self.psx_printer_var.get().strip().lower() == "yes":
+                client.send_printer_message(
+                    username="TestDonor",
+                    message="This is a PSX printer test",
+                    amount="$25.00",
+                    currency="USD",
+                )
+                self._queue_log("PSX Printer test receipt sent.")
+        except Exception as exc:
+            self._queue_log(f"PSX test failed: {exc}")
+
     def _on_close(self):
         self.listener.stop()
+        if self.psx_client:
+            try:
+                self.psx_client.disconnect()
+            except Exception:
+                pass
         self.root.destroy()
 
 
